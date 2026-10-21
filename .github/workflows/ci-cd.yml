@@ -1,0 +1,185 @@
+name: CI/CD Pipeline
+
+# One pipeline that demonstrates all three practices:
+#   Continuous Integration    -> jobs 1-3 run on EVERY push and pull request
+#   Continuous Deployment     -> job 4 deploys to STAGING automatically on main
+#   Continuous Delivery       -> job 5 promotes to PRODUCTION after MANUAL approval
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ───────────────────────── CONTINUOUS INTEGRATION ─────────────────────────
+  frontend:
+    name: 1 · Frontend (lint, test, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Unit tests
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Keep the production bundle as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
+          retention-days: 7
+
+  backend:
+    name: 2 · Backend (unit tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - name: Unit tests (PCA engine + seed data integrity)
+        run: npm test
+
+  docker:
+    name: 3 · Docker image (${{ matrix.name }})
+    needs: [frontend, backend]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: api
+            context: ./backend
+            file: ./backend/Dockerfile
+          - name: web
+            context: .
+            file: ./Dockerfile
+    env:
+      PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Compute image name (registry names must be lowercase)
+        id: meta
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}-${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - name: Log in to GitHub Container Registry
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # ──────────────── CONTINUOUS DEPLOYMENT (automatic, no approval) ───────────
+  deploy-staging:
+    name: 4 · Deploy to STAGING (automatic)
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Deploy the exact images CI just built
+        run: |
+          IMG="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "API_IMAGE=${IMG}-api:sha-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "WEB_IMAGE=${IMG}-web:sha-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: Start the full stack (MongoDB + seed + API + web)
+        run: docker compose -f docker-compose.deploy.yml up -d
+      - name: Smoke tests
+        run: scripts/smoke-test.sh http://localhost:8080 http://localhost:4000
+      - name: Show container logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.deploy.yml logs --no-color
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.deploy.yml down -v
+
+  # ───────── CONTINUOUS DELIVERY (waits for a human to approve release) ──────
+  deploy-production:
+    name: 5 · Release to PRODUCTION (manual approval)
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    # The "production" environment has Required reviewers configured, so this
+    # job pauses here until someone clicks "Review deployments -> Approve".
+    environment:
+      name: production
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote the tested images (retag, no rebuild)
+        run: |
+          IMG="ghcr.io/${GITHUB_REPOSITORY,,}"
+          for svc in api web; do
+            docker buildx imagetools create \
+              -t "${IMG}-${svc}:latest" \
+              -t "${IMG}-${svc}:release-${{ github.run_number }}" \
+              "${IMG}-${svc}:sha-${GITHUB_SHA::7}"
+          done
+      - name: Trigger production host (optional)
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.DEPLOY_HOOK_URL }}
+        run: |
+          if [ -n "$DEPLOY_HOOK_URL" ]; then
+            curl -fsS -X POST "$DEPLOY_HOOK_URL"
+          else
+            echo "No DEPLOY_HOOK_URL secret set - images promoted to :latest only."
+          fi
+      - name: Summary
+        run: |
+          {
+            echo "### Released to production"
+            echo "- Commit: \`${GITHUB_SHA::7}\`"
+            echo "- Release tag: \`release-${{ github.run_number }}\`"
+            echo "- Images: \`ghcr.io/${GITHUB_REPOSITORY,,}-api\`, \`ghcr.io/${GITHUB_REPOSITORY,,}-web\`"
+          } >> "$GITHUB_STEP_SUMMARY"

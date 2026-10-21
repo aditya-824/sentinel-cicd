@@ -1,0 +1,38 @@
+# Deployment stack: runs the images that CI already built and pushed to the
+# registry (build once, deploy the same artifact everywhere).
+# Required env: API_IMAGE, WEB_IMAGE  (e.g. ghcr.io/<owner>/<repo>-api:sha-abc1234)
+services:
+  web:
+    image: ${WEB_IMAGE}
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+  api:
+    image: ${API_IMAGE}
+    ports:
+      - "4000:4000"
+    environment:
+      MONGO_URI: mongodb://mongo:27017/sentinel
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+  seed:
+    image: ${API_IMAGE}
+    command: npm run seed
+    environment:
+      MONGO_URI: mongodb://mongo:27017/sentinel
+    depends_on:
+      mongo:
+        condition: service_healthy
+  mongo:
+    image: mongo:8
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' localhost:27017/sentinel | grep 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
